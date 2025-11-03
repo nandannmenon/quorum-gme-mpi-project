@@ -1,4 +1,4 @@
-# Extended Group Mutual Exclusion in MPI
+# Quorum based Extended Group Mutual Exclusion in MPI
 
 This project is a **C and MPI implementation** of the distributed algorithm from the paper:
 
