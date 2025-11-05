@@ -133,4 +133,4 @@ except FileNotFoundError:
     print(f"Error: Log file '{LOG_FILE}' not found.")
     print(f"Please run 'mpirun -np 6 ./gme_mpi > {LOG_FILE} 2>&1' first.")
 except Exception as e:
-    print(f"An error occurred: {e}")w
+    print(f"An error occurred: {e}")
