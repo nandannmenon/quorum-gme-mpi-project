@@ -1,466 +1,412 @@
-/*
- * MPI IMPLEMENTATION OF:
- * A quorum-based extended group mutual exclusion algorithm
- */
+/* manabe & park extended gme – strict, cleaned, optimized */
 
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h> // For sleep()
+#include <unistd.h>
+#include <stdbool.h>
 
-// --- 1. Configuration ---
 #define NUM_MANAGERS 3
 #define NUM_GROUPS 2
-#define MAX_QUEUE_SIZE 10
+#define MAX_QUEUE 128
+#define SIM_SECONDS 15.0
 
-// --- 2. Message Tags ---
-typedef enum {
-    TAG_REQUEST, TAG_OK, TAG_LOCK, TAG_ENTER,
-    TAG_RELEASE, TAG_NONEED, 
-    TAG_CANCEL,    
-    TAG_CANCELLED, 
-    TAG_FINISHED, TAG_OVER
-} MessageTag;
+/* message tags */
+enum { TAG_REQUEST, TAG_OK, TAG_LOCK, TAG_ENTER,
+       TAG_RELEASE, TAG_NONEED, TAG_CANCEL,
+       TAG_CANCELLED, TAG_FINISHED, TAG_OVER };
 
-// --- 3. Message Payload Struct ---
+/* message payload */
 typedef struct {
-    int timestamp; // This is the ID/priority of the request
+    int timestamp;
     int rank;
+    bool gset[NUM_GROUPS];
     int group;
-} MsgData;
+} Msg;
 
-// --- 4. Manager Logic ---
+/* manager states */
+typedef enum { M_VACANT, M_WAITLOCK, M_LOCKED, M_RELEASING, M_WAITCANCEL } MState;
+/* requester states */
+typedef enum { R_IDLE, R_WAIT, R_IN, R_OUT } RState;
 
-typedef enum { M_VACANT, M_WAITLOCK, M_LOCKED, M_RELEASING, M_WAITCANCEL } ManagerStatus;
-
-int max(int a, int b) { return (a > b) ? a : b; }
-
-// (find_highest_priority - no changes)
-int find_highest_priority(MsgData* queue, int count) {
-    if (count == 0) return -1;
-    int min_ts = queue[0].timestamp;
-    int min_idx = 0;
-    for (int i = 1; i < count; i++) {
-        if (queue[i].timestamp < min_ts) {
-            min_ts = queue[i].timestamp;
-            min_idx = i;
-        } else if (queue[i].timestamp == min_ts && queue[i].rank < queue[min_idx].rank) {
-            min_ts = queue[i].timestamp;
-            min_idx = i;
-        }
-    }
-    return min_idx;
+/* helpers */
+static inline int max2(int a,int b){ return a>b?a:b; }
+static inline int higher(int ts1,int r1,int ts2,int r2){
+    if(ts1<ts2) return 1;
+    if(ts1>ts2) return 0;
+    return r1<r2;
 }
 
-// (dequeue_priority_item - no changes)
-MsgData dequeue_priority_item(MsgData* queue, int* count, int idx) {
-    MsgData req = queue[idx];
-    queue[idx] = queue[*count - 1];
-    (*count)--;
-    return req;
+/* coterie for 3 managers */
+#define COT_SIZE 3
+#define QSIZE 2
+static const int COT[COT_SIZE][QSIZE]={{0,1},{1,2},{0,2}};
+
+/* queue utils */
+static int best(Msg*q,int n){
+    if(!n) return -1;
+    int b=0;
+    for(int i=1;i<n;i++)
+        if(higher(q[i].timestamp,q[i].rank,q[b].timestamp,q[b].rank)) b=i;
+    return b;
+}
+static Msg pop_idx(Msg*q,int* n,int i){
+    Msg x=q[i];
+    q[i]=q[*n-1];
+    (*n)--;
+    return x;
+}
+static void push_pri(Msg*q,int*n,Msg m){
+    if(*n>=MAX_QUEUE) return;
+    int i=*n-1;
+    while(i>=0){
+        if(higher(q[i].timestamp,q[i].rank,m.timestamp,m.rank))
+            q[i+1]=q[i], i--;
+        else break;
+    }
+    q[i+1]=m;
+    (*n)++;
 }
 
-// (try_service_queue - no changes)
-void try_service_queue(int rank, ManagerStatus* status, MsgData* queue, 
-                       int* queue_count, MsgData* sentok_to, 
-                       int* lamport_clock, MPI_Datatype mpi_msg_type) 
-{
-    if (*status == M_VACANT && *queue_count > 0) {
-        int prio_idx = find_highest_priority(queue, *queue_count);
-        MsgData next_req = dequeue_priority_item(queue, queue_count, prio_idx);
-        printf("[Manager %d]: Status is VACANT. Dequeuing priority request from %d (ts %d). (Queue size: %d)\n",
-               rank, next_req.rank, next_req.timestamp, *queue_count);
-        *sentok_to = next_req;
-        MsgData ok_msg;
-        ok_msg.rank = rank;
-        ok_msg.timestamp = next_req.timestamp;
-        (*lamport_clock)++;
-        MPI_Send(&ok_msg, 1, mpi_msg_type, next_req.rank, TAG_OK, MPI_COMM_WORLD);
-        *status = M_WAITLOCK;
-    }
+/* set utils */
+static int in_set(int*s,int n,int x){
+    for(int i=0;i<n;i++) if(s[i]==x) return 1;
+    return 0;
+}
+static int erase(int*s,int* n,int x){
+    for(int i=0;i<*n;i++)
+        if(s[i]==x){ s[i]=s[*n-1]; (*n)--; return 1; }
+    return 0;
 }
 
+/************************ manager ************************/
+void manager(int rank,MPI_Datatype T){
 
-// (manager_role - no changes from Step 8)
-void manager_role(int rank, int world_size, MPI_Datatype mpi_msg_type) {
-    ManagerStatus status = M_VACANT;
-    int current_group = -1;
-    int lamport_clock = 0;
-    MsgData sentok_to;
-    sentok_to.timestamp = -1;
-    sentok_to.rank = -1;
-    int using_set[MAX_QUEUE_SIZE];
-    int using_count = 0;
-    int pivot_releaser_rank = -1;
-    MsgData request_queue[MAX_QUEUE_SIZE];
-    int queue_count = 0;
-    int group_queue[MAX_QUEUE_SIZE];
-    printf("[Manager %d]: Online.\n", rank);
+    MState st=M_VACANT;
+    int lam=0;
 
-    while (1) {
-        MsgData msg;
-        int source_rank;
-        int tag;
-        MPI_Status mpi_status;
-        MPI_Recv(&msg, 1, mpi_msg_type, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &mpi_status);
-        source_rank = mpi_status.MPI_SOURCE;
-        tag = mpi_status.MPI_TAG;
-        lamport_clock = max(lamport_clock, msg.timestamp) + 1;
+    int gm=-1;                   /* current group */
+    bool gmset[NUM_GROUPS]={0};  /* pivot group set */
+    int pivot=-1;                /* pivot id */
+    int pts=-1;                  /* pivot ts */
 
-        switch (tag) {
-            case TAG_REQUEST:
-            {
-                printf("[Manager %d]: Received REQUEST(g=%d) from %d (ts %d).\n", 
-                       rank, msg.group, source_rank, msg.timestamp);
-                if (status == M_WAITLOCK) {
-                    int new_has_priority = 0;
-                    if (msg.timestamp < sentok_to.timestamp) {
-                        new_has_priority = 1;
-                    } else if (msg.timestamp == sentok_to.timestamp && msg.rank < sentok_to.rank) {
-                        new_has_priority = 1;
-                    }
-                    if (new_has_priority) {
-                        printf("[Manager %d]: New request from %d (ts %d) has priority over %d (ts %d). Sending CANCEL.\n",
-                               rank, msg.rank, msg.timestamp, sentok_to.rank, sentok_to.timestamp);
-                        MsgData cancel_msg;
-                        cancel_msg.rank = rank;
-                        cancel_msg.timestamp = sentok_to.timestamp;
-                        lamport_clock++;
-                        MPI_Send(&cancel_msg, 1, mpi_msg_type, sentok_to.rank, TAG_CANCEL, MPI_COMM_WORLD);
-                        status = M_WAITCANCEL;
-                    }
-                }
-                if (queue_count >= MAX_QUEUE_SIZE) { break; }
-                request_queue[queue_count] = msg;
-                group_queue[queue_count] = msg.group;
-                queue_count++;
-                if (status != M_LOCKED) {
-                    printf("[Manager %d]: Enqueued request from %d. (Queue size: %d)\n", 
-                           rank, source_rank, queue_count);
-                }
-                if (status == M_LOCKED && msg.group == current_group) {
-                    queue_count--;
-                    printf("[Manager %d]: Status is LOCKED(g=%d) and groups match. Sending ENTER to %d.\n",
-                           rank, current_group, source_rank);
-                    MsgData enter_msg;
-                    enter_msg.rank = rank;
-                    enter_msg.group = current_group;
-                    enter_msg.timestamp = msg.timestamp;
-                    lamport_clock++;
-                    MPI_Send(&enter_msg, 1, mpi_msg_type, source_rank, TAG_ENTER, MPI_COMM_WORLD);
-                    using_set[using_count++] = source_rank;
-                }
-                try_service_queue(rank, &status, request_queue, 
-                                  &queue_count, &sentok_to, 
-                                  &lamport_clock, mpi_msg_type);
-                break;
-            } 
-            case TAG_LOCK:
-                current_group = msg.group;
-                printf("[Manager %d]: Received LOCK(g=%d) from %d (ts %d).\n", 
-                       rank, current_group, source_rank, msg.timestamp);
-                if (status == M_WAITLOCK && source_rank == sentok_to.rank && msg.timestamp == sentok_to.timestamp) {
-                    status = M_LOCKED;
-                    sentok_to.rank = -1;
-                } else if (status == M_WAITCANCEL && source_rank == sentok_to.rank) {
-                    printf("[Manager %d]: WARNING: Received LOCK from %d after sending CANCEL. Honoring LOCK.\n", rank, source_rank);
-                    status = M_LOCKED;
-                    sentok_to.rank = -1;
-                }
-                int new_queue_count = 0;
-                MsgData new_request_queue[MAX_QUEUE_SIZE];
-                int new_group_queue[MAX_QUEUE_SIZE];
-                for (int i = 0; i < queue_count; i++) {
-                    MsgData queued_req = request_queue[i];
-                    if (queued_req.group == current_group) {
-                        printf("[Manager %d]: Found compatible waiter %d (ts %d) in queue. Sending ENTER(g=%d).\n",
-                               rank, queued_req.rank, queued_req.timestamp, current_group);
-                        MsgData enter_msg;
-                        enter_msg.rank = rank;
-                        enter_msg.group = current_group;
-                        enter_msg.timestamp = queued_req.timestamp;
-                        lamport_clock++;
-                        MPI_Send(&enter_msg, 1, mpi_msg_type, queued_req.rank, TAG_ENTER, MPI_COMM_WORLD);
-                        using_set[using_count++] = queued_req.rank;
-                    } else {
-                        new_request_queue[new_queue_count] = queued_req;
-                        new_group_queue[new_queue_count] = group_queue[i];
-                        new_queue_count++;
-                    }
-                }
-                queue_count = new_queue_count;
-                for(int i=0; i < queue_count; i++) {
-                    request_queue[i] = new_request_queue[i];
-                    group_queue[i] = new_group_queue[i];
-                }
-                break;
-            case TAG_RELEASE:
-                printf("[Manager %d]: Received RELEASE from pivot %d (ts %d). Entering RELEASING state.\n", 
-                       rank, source_rank, msg.timestamp);
-                status = M_RELEASING;
-                pivot_releaser_rank = source_rank;
-                if (using_count == 0) {
-                    printf("[Manager %d]: `using_set` is empty. Sending FINISHED to %d.\n", 
-                           rank, pivot_releaser_rank);
-                    MsgData finish_msg;
-                    finish_msg.rank = rank;
-                    finish_msg.timestamp = msg.timestamp;
-                    lamport_clock++;
-                    MPI_Send(&finish_msg, 1, mpi_msg_type, pivot_releaser_rank, TAG_FINISHED, MPI_COMM_WORLD);
-                }
-                break;
-            case TAG_NONEED:
-                printf("[Manager %d]: Received NONEED from %d (ts %d).\n", rank, source_rank, msg.timestamp);
-                if (status == M_WAITCANCEL && sentok_to.rank == source_rank && sentok_to.timestamp == msg.timestamp) {
-                    printf("[Manager %d]: IGNORED NONEED from %d, was expecting CANCELLED.\n", rank, source_rank);
-                }
-                for (int i = 0; i < using_count; i++) {
-                    if (using_set[i] == source_rank) {
-                        using_set[i] = using_set[using_count - 1];
-                        using_count--;
-                        break;
-                    }
-                }
-                if (status == M_RELEASING && using_count == 0) {
-                    printf("[Manager %d]: `using_set` is now empty. Sending FINISHED to pivot %d.\n", 
-                           rank, pivot_releaser_rank);
-                    MsgData finish_msg;
-                    finish_msg.rank = rank;
-                    finish_msg.timestamp = lamport_clock; 
-                    lamport_clock++;
-                    MPI_Send(&finish_msg, 1, mpi_msg_type, pivot_releaser_rank, TAG_FINISHED, MPI_COMM_WORLD);
-                }
-                break;
-            case TAG_CANCELLED:
-                printf("[Manager %d]: Received CANCELLED from %d (for ts %d).\n", rank, source_rank, msg.timestamp);
-                if (status == M_WAITCANCEL && source_rank == sentok_to.rank) {
-                    sentok_to.rank = -1;
-                    status = M_VACANT;
-                    try_service_queue(rank, &status, request_queue, 
-                                      &queue_count, &sentok_to, 
-                                      &lamport_clock, mpi_msg_type);
-                }
-                break;
-            case TAG_OVER:
-                printf("[Manager %d]: Received OVER from pivot %d (ts %d). Setting status to VACANT.\n", 
-                       rank, source_rank, msg.timestamp);
-                status = M_VACANT;
-                pivot_releaser_rank = -1;
-                current_group = -1;
-                try_service_queue(rank, &status, request_queue, 
-                                  &queue_count, &sentok_to, 
-                                  &lamport_clock, mpi_msg_type);
-                break;
-            default:
-                printf("[Manager %d]: Received unhandled tag %d from %d.\n", rank, tag, source_rank);
-        }
-    }
-}
+    Msg Q[MAX_QUEUE];            /* request queue */
+    int qn=0;
 
-// --- 5. Requester Logic ---
+    Msg okto; okto.rank=-1;      /* last ok target */
+    int follower[MAX_QUEUE];     /* followers */
+    int fn=0;
 
-typedef enum { R_IDLE, R_WAIT, R_IN_CS, R_OUT_CS } RequesterStatus;
+    double start=MPI_Wtime();
 
-void requester_role(int rank, int world_size, MPI_Datatype mpi_msg_type) {
-    RequesterStatus status = R_IDLE;
-    int ok_replies = 0;
-    int finished_replies = 0;
-    int lamport_clock = 0;
-    int my_timestamp = 0; 
-    int quorum_size = (int)(NUM_MANAGERS / 2) + 1;
-    int quorum[quorum_size];
-    for(int i = 0; i < quorum_size; i++) {
-        quorum[i] = i; 
-    }
-    int my_group;
-    if (rank == 3 || rank == 4) {
-        my_group = 0;
-    } else {
-        my_group = 1;
-    }
-    printf("[Requester %d]: Online. My group is %d. My quorum is %d managers.\n", 
-           rank, my_group, quorum_size);
+    while(1){
+        if(MPI_Wtime()-start >= SIM_SECONDS) break;
 
-    while (1) {
-        if (status == R_IDLE) {
-            printf("[Requester %d]: Want to enter CS for group %d.\n", rank, my_group);
-            lamport_clock++;
-            my_timestamp = lamport_clock;
-            status = R_WAIT;
-            ok_replies = 0;
-            finished_replies = 0;
-            MsgData request_msg;
-            request_msg.rank = rank;
-            request_msg.group = my_group;
-            request_msg.timestamp = my_timestamp;
-            for (int i = 0; i < quorum_size; i++) {
-                MPI_Send(&request_msg, 1, mpi_msg_type, quorum[i], TAG_REQUEST, MPI_COMM_WORLD);
+        MPI_Status s; int f=0;
+        MPI_Iprobe(MPI_ANY_SOURCE,MPI_ANY_TAG,MPI_COMM_WORLD,&f,&s);
+        if(!f){ usleep(5000); continue; }
+
+        Msg m;
+        MPI_Recv(&m,1,T,s.MPI_SOURCE,s.MPI_TAG,MPI_COMM_WORLD,&s);
+        lam=max2(lam,m.timestamp)+1;
+
+        int src=s.MPI_SOURCE;
+        int tag=s.MPI_TAG;
+
+        switch(tag){
+
+        /* request: queue and possibly send ok */
+        case TAG_REQUEST:{
+            push_pri(Q,&qn,m);
+
+            if(st==M_VACANT){
+                int i=best(Q,qn);
+                if(i>=0){
+                    Msg x=pop_idx(Q,&qn,i);
+                    okto=x;
+                    Msg ok={x.timestamp,rank,{0},-1};
+                    memcpy(ok.gset,x.gset,sizeof(ok.gset));
+                    MPI_Send(&ok,1,T,x.rank,TAG_OK,MPI_COMM_WORLD);
+                    st=M_WAITLOCK;
+                }
             }
-            printf("[Requester %d]: Sent REQUEST with ts %d.\n", rank, my_timestamp);
-        }
-        
-        MsgData msg;
-        int source;
-        int tag;
-        MPI_Status mpi_status;
-        MPI_Recv(&msg, 1, mpi_msg_type, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &mpi_status);
-        source = mpi_status.MPI_SOURCE;
-        tag = mpi_status.MPI_TAG;
-        lamport_clock = max(lamport_clock, msg.timestamp) + 1;
-        
-        // --- THIS IS THE FINAL FIX ---
-        // We *only* handle messages based on our current state.
-        
-        if (status == R_WAIT) {
-            // --- Zombie message filter ---
-            if (msg.timestamp != my_timestamp) {
-                if (tag == TAG_OK || tag == TAG_ENTER || tag == TAG_CANCEL) {
-                    printf("[Requester %d]: In R_WAIT, IGNORING ZOMBIE MSG (tag %d) from %d (ts %d != my_ts %d)\n",
-                           rank, tag, source, msg.timestamp, my_timestamp);
-                    continue; // Discard
+            else if(st==M_WAITLOCK && okto.rank>=0){
+                if(higher(m.timestamp,m.rank,okto.timestamp,okto.rank)){
+                    Msg c={okto.timestamp,rank,{0},-1};
+                    MPI_Send(&c,1,T,okto.rank,TAG_CANCEL,MPI_COMM_WORLD);
+                    st=M_WAITCANCEL;
                 }
             }
 
-            if (tag == TAG_OK) {
-                printf("[Requester %d]: Received OK from %d (for ts %d).\n", rank, source, msg.timestamp);
-                ok_replies++;
-                
-                if (ok_replies == quorum_size) {
-                    printf("[Requester %d]: Got all %d OKs. Sending LOCK(g=%d).\n", 
-                           rank, quorum_size, my_group);
-                    MsgData lock_msg;
-                    lock_msg.rank = rank;
-                    lock_msg.group = my_group;
-                    lock_msg.timestamp = my_timestamp;
-                    lamport_clock++;
-                    for (int i = 0; i < quorum_size; i++) {
-                        MPI_Send(&lock_msg, 1, mpi_msg_type, quorum[i], TAG_LOCK, MPI_COMM_WORLD);
-                    }
-                    printf("\n>>>>>>>>>> [Requester %d]: ENTERING CS (as pivot for g=%d)\n\n", rank, my_group);
-                    status = R_IN_CS;
+            /* send enter if locked and allowed */
+            if(st==M_LOCKED && st!=M_RELEASING && st!=M_WAITCANCEL){
+                for(int i=0;i<qn;){
+                    int outr=higher(Q[i].timestamp,Q[i].rank,pts,pivot);
+                    if(Q[i].gset[gm] && !outr){
+                        Msg e={Q[i].timestamp,rank,{0},gm};
+                        memcpy(e.gset,gmset,sizeof(e.gset));
+                        MPI_Send(&e,1,T,Q[i].rank,TAG_ENTER,MPI_COMM_WORLD);
+                        if(!in_set(follower,fn,Q[i].rank)) follower[fn++]=Q[i].rank;
+                        pop_idx(Q,&qn,i);
+                    } else i++;
+                }
+            }
+        } break;
+
+        /* lock: pivot chosen */
+        case TAG_LOCK:{
+            gm=m.group;
+            memcpy(gmset,m.gset,sizeof(gmset));
+            pivot=m.rank;
+            pts=m.timestamp;
+            okto.rank=-1;
+            st=M_LOCKED;
+            fn=0;
+
+            if(st!=M_RELEASING && st!=M_WAITCANCEL){
+                Msg tmp[MAX_QUEUE]; int tn=0;
+                for(int i=0;i<qn;i++){
+                    int outr=higher(Q[i].timestamp,Q[i].rank,pts,pivot);
+                    if(Q[i].gset[gm] && !outr){
+                        Msg e={Q[i].timestamp,rank,{0},gm};
+                        memcpy(e.gset,gmset,sizeof(e.gset));
+                        MPI_Send(&e,1,T,Q[i].rank,TAG_ENTER,MPI_COMM_WORLD);
+                        if(!in_set(follower,fn,Q[i].rank)) follower[fn++]=Q[i].rank;
+                    } else tmp[tn++]=Q[i];
+                }
+                qn=tn;
+                for(int i=0;i<qn;i++) Q[i]=tmp[i];
+            }
+        } break;
+
+        /* release: begin releasing phase */
+        case TAG_RELEASE:{
+            st=M_RELEASING;
+            pivot=src;
+            pts=m.timestamp;
+            if(fn==0){
+                Msg fin={pts,rank,{0},-1};
+                MPI_Send(&fin,1,T,pivot,TAG_FINISHED,MPI_COMM_WORLD);
+            }
+        } break;
+
+        /* noneed: follower done */
+        case TAG_NONEED:{
+            erase(follower,&fn,src);
+
+            if(st==M_RELEASING && fn==0 && pivot>=0){
+                Msg fin={pts,rank,{0},-1};
+                MPI_Send(&fin,1,T,pivot,TAG_FINISHED,MPI_COMM_WORLD);
+            }
+
+            if(st==M_WAITCANCEL &&
+               okto.rank==src && okto.timestamp==m.timestamp){
+                okto.rank=-1;
+                st=M_VACANT;
+                int i=best(Q,qn);
+                if(i>=0){
+                    Msg x=pop_idx(Q,&qn,i);
+                    okto=x;
+                    Msg ok={x.timestamp,rank,{0},-1};
+                    memcpy(ok.gset,x.gset,sizeof(ok.gset));
+                    MPI_Send(&ok,1,T,x.rank,TAG_OK,MPI_COMM_WORLD);
+                    st=M_WAITLOCK;
+                }
+            }
+        } break;
+
+        /* cancelled ack */
+        case TAG_CANCELLED:{
+            if(st==M_WAITCANCEL && okto.rank==src){
+                okto.rank=-1;
+                st=M_VACANT;
+                int i=best(Q,qn);
+                if(i>=0){
+                    Msg x=pop_idx(Q,&qn,i);
+                    okto=x;
+                    Msg ok={x.timestamp,rank,{0},-1};
+                    memcpy(ok.gset,x.gset,sizeof(ok.gset));
+                    MPI_Send(&ok,1,T,x.rank,TAG_OK,MPI_COMM_WORLD);
+                    st=M_WAITLOCK;
+                }
+            }
+        } break;
+
+        /* over: pivot finished cycle */
+        case TAG_OVER:{
+            st=M_VACANT;
+            gm=-1; pivot=-1; pts=-1; fn=0;
+            memset(gmset,0,sizeof(gmset));
+
+            int i=best(Q,qn);
+            if(i>=0){
+                Msg x=pop_idx(Q,&qn,i);
+                okto=x;
+                Msg ok={x.timestamp,rank,{0},-1};
+                memcpy(ok.gset,x.gset,sizeof(ok.gset));
+                MPI_Send(&ok,1,T,x.rank,TAG_OK,MPI_COMM_WORLD);
+                st=M_WAITLOCK;
+            }
+        } break;
+        }
+    }
+}
+
+/************************ requester ************************/
+void requester(int rank,MPI_Datatype T){
+
+    RState st=R_IDLE;
+    int lam=0;
+    int myts=0;
+
+    bool gs[NUM_GROUPS]={0};
+    if(rank==NUM_MANAGERS) gs[0]=1;
+    else if(rank==NUM_MANAGERS+1){ gs[0]=1; gs[1]=1; }
+    else gs[1]=1;
+
+    int Q[QSIZE], Qn=0;
+    int okc=0;
+    Msg okv[MAX_QUEUE];
+    int okn=0;
+    int finc=0;
+
+    int mask=0;
+    for(int i=0;i<NUM_GROUPS;i++) if(gs[i]) mask|=(1<<i);
+
+    double start=MPI_Wtime();
+
+    while(1){
+        if(MPI_Wtime()-start>=SIM_SECONDS) break;
+
+        if(st==R_IDLE){
+            sleep(1);
+            myts=++lam;
+            okc=0; okn=0; finc=0;
+
+            int ch=(rank+mask)%COT_SIZE;
+            Qn=QSIZE;
+            for(int i=0;i<Qn;i++) Q[i]=COT[ch][i];
+
+            Msg r={myts,rank,{0},-1};
+            memcpy(r.gset,gs,sizeof(gs));
+            for(int i=0;i<Qn;i++)
+                MPI_Send(&r,1,T,Q[i],TAG_REQUEST,MPI_COMM_WORLD);
+
+            st=R_WAIT;
+        }
+
+        MPI_Status s; int f=0;
+        MPI_Iprobe(MPI_ANY_SOURCE,MPI_ANY_TAG,MPI_COMM_WORLD,&f,&s);
+        if(!f){ usleep(5000); continue; }
+
+        Msg m;
+        MPI_Recv(&m,1,T,s.MPI_SOURCE,s.MPI_TAG,MPI_COMM_WORLD,&s);
+        lam=max2(lam,m.timestamp)+1;
+
+        int src=s.MPI_SOURCE;
+        int tag=s.MPI_TAG;
+
+        if(st==R_WAIT){
+
+            if(m.timestamp!=myts &&
+               (tag==TAG_OK||tag==TAG_ENTER||tag==TAG_CANCEL||tag==TAG_FINISHED))
+                continue;
+
+            if(tag==TAG_OK){
+                okv[okn++]=m;
+                if(++okc == Qn){
+                    int g=-1;
+                    for(int i=0;i<NUM_GROUPS;i++) if(gs[i]){ g=i; break; }
+                    if(g<0) g=0;
+
+                    Msg l={myts,rank,{0},g};
+                    memcpy(l.gset,gs,sizeof(gs));
+                    for(int i=0;i<Qn;i++)
+                        MPI_Send(&l,1,T,Q[i],TAG_LOCK,MPI_COMM_WORLD);
+
+                    st=R_IN;
                     sleep(2);
-                    printf("\n<<<<<<<<<< [Requester %d]: EXITING CS (as pivot for g=%d)\n\n", rank, my_group);
-                    status = R_OUT_CS;
-                    MsgData release_msg;
-                    release_msg.rank = rank;
-                    release_msg.timestamp = my_timestamp;
-                    printf("[Requester %d]: Sending RELEASE.\n", rank);
-                    lamport_clock++;
-                    for (int i = 0; i < quorum_size; i++) {
-                        MPI_Send(&release_msg, 1, mpi_msg_type, quorum[i], TAG_RELEASE, MPI_COMM_WORLD);
-                    }
-                    printf("[Requester %d]: Waiting for FINISHED from %d managers...\n", rank, quorum_size);
+
+                    Msg rel={myts,rank,{0},g};
+                    for(int i=0;i<Qn;i++)
+                        MPI_Send(&rel,1,T,Q[i],TAG_RELEASE,MPI_COMM_WORLD);
+
+                    st=R_OUT;
+                    finc=0;
                 }
-            
-            } else if (tag == TAG_ENTER) {
-                int entered_group = msg.group;
-                printf("[Requester %d]: Received ENTER(g=%d) from %d (for ts %d).\n", 
-                       rank, entered_group, source, msg.timestamp);
-                status = R_IN_CS; 
-                printf("\n>>>>>>>>>> [Requester %d]: ENTERING CS (via Enter for g=%d)\n\n", rank, entered_group);
+            }
+            else if(tag==TAG_ENTER){
+                int g=m.group;
+                int ets=m.timestamp;
+
+                Msg nd={ets,rank,{0},g};
+
+                for(int i=0;i<Qn;i++)
+                    MPI_Send(&nd,1,T,Q[i],TAG_NONEED,MPI_COMM_WORLD);
+
+                st=R_IN;
                 sleep(2);
-                printf("\n<<<<<<<<<< [Requester %d]: EXITING CS (via Enter for g=%d)\n\n", rank, entered_group);
-                MsgData noneed_msg;
-                noneed_msg.rank = rank;
-                noneed_msg.timestamp = my_timestamp;
-                printf("[Requester %d]: Sending NONEED to all quorum members.\n", rank);
-                lamport_clock++;
-                for (int i = 0; i < quorum_size; i++) {
-                    MPI_Send(&noneed_msg, 1, mpi_msg_type, quorum[i], TAG_NONEED, MPI_COMM_WORLD);
-                }
-                status = R_IDLE;
-            
-            // --- FIX: `CANCEL` is now handled *inside* R_WAIT ---
-            } else if (tag == TAG_CANCEL) {
-                printf("[Requester %d]: Received CANCEL from %d (for ts %d). My 'OK' was revoked.\n",
-                       rank, source, msg.timestamp);
-                
-                MsgData cancelled_msg;
-                cancelled_msg.rank = rank;
-                cancelled_msg.timestamp = my_timestamp;
-                
-                lamport_clock++;
-                MPI_Send(&cancelled_msg, 1, mpi_msg_type, source, TAG_CANCELLED, MPI_COMM_WORLD);
-                
-                // Reset state to wait for new OKs
-                status = R_WAIT;
-                ok_replies = 0;
+
+                for(int i=0;i<Qn;i++)
+                    MPI_Send(&nd,1,T,Q[i],TAG_NONEED,MPI_COMM_WORLD);
+
+                st=R_IDLE;
             }
-        
-        } else if (status == R_OUT_CS) {
-            // --- Pivot's "wait for finished" state ---
-            if (tag == TAG_FINISHED) {
-                printf("[Requester %d]: Received FINISHED from %d.\n", rank, source);
-                finished_replies++;
-                
-                if (finished_replies == quorum_size) {
-                    printf("[Requester %d]: Got all FINISHED. Sending OVER.\n", rank);
-                    MsgData over_msg;
-                    over_msg.rank = rank;
-                    over_msg.timestamp = my_timestamp;
-                    lamport_clock++;
-                    for (int i = 0; i < quorum_size; i++) {
-                        MPI_Send(&over_msg, 1, mpi_msg_type, quorum[i], TAG_OVER, MPI_COMM_WORLD);
-                    }
-                    status = R_IDLE;
-                }
-            } else {
-                // --- FIX: We are in R_OUT_CS, so we *ignore* any late-arriving CANCEL ---
-                printf("[Requester %d]: In R_OUT_CS, ignoring tag %d from %d (ts %d). My commit won.\n", 
-                       rank, tag, source, msg.timestamp);
+            else if(tag==TAG_CANCEL){
+                Msg c={myts,rank,{0},-1};
+                MPI_Send(&c,1,T,src,TAG_CANCELLED,MPI_COMM_WORLD);
+                st=R_IDLE;
+                sleep(1);
             }
-        
-        } else if (status == R_IDLE) {
-            printf("[Requester %d]: In R_IDLE, ignoring tag %d from %d.\n", rank, tag, source);
-            printf("[Requester %d]: CS procedure complete. Idling for 5 seconds.\n", rank);
-            sleep(5);
+        }
+        else if(st==R_OUT){
+            if(tag==TAG_FINISHED && m.timestamp==myts){
+                if(++finc == Qn){
+                    Msg o={myts,rank,{0},-1};
+                    for(int i=0;i<Qn;i++)
+                        MPI_Send(&o,1,T,Q[i],TAG_OVER,MPI_COMM_WORLD);
+                    st=R_IDLE;
+                }
+            }
         }
     }
 }
 
-// --- 6. Main Function ---
+/************************ main ************************/
+int main(int argc,char**argv){
+    MPI_Init(&argc,&argv);
 
-int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
+    int r,n;
+    MPI_Comm_rank(MPI_COMM_WORLD,&r);
+    MPI_Comm_size(MPI_COMM_WORLD,&n);
 
-    int world_rank;
-    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
-    
-    int world_size;
-    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-
-    if (world_size <= NUM_MANAGERS) { /*...*/ MPI_Finalize(); return 1; }
-
-    // --- Create the custom MPI Datatype ---
-    MPI_Datatype mpi_msg_type;
-    int blocks[3] = {1, 1, 1};
-    MPI_Aint displacements[3];
-    MPI_Datatype types[3] = {MPI_INT, MPI_INT, MPI_INT};
-    
-    MsgData dummy_msg;
-    MPI_Aint base_address;
-    MPI_Get_address(&dummy_msg, &base_address);
-    MPI_Get_address(&dummy_msg.timestamp, &displacements[0]);
-    MPI_Get_address(&dummy_msg.rank, &displacements[1]);
-    MPI_Get_address(&dummy_msg.group, &displacements[2]);
-    
-    displacements[0] = MPI_Aint_diff(displacements[0], base_address);
-    displacements[1] = MPI_Aint_diff(displacements[1], base_address);
-    displacements[2] = MPI_Aint_diff(displacements[2], base_address);
-    
-    MPI_Type_create_struct(3, blocks, displacements, types, &mpi_msg_type);
-    MPI_Type_commit(&mpi_msg_type);
-    // --- End of Datatype Creation ---
-
-
-    if (world_rank < NUM_MANAGERS) {
-        manager_role(world_rank, world_size, mpi_msg_type);
-    } else {
-        requester_role(world_rank, world_size, mpi_msg_type);
+    if(n<=NUM_MANAGERS){
+        if(r==0) fprintf(stderr,"need at least %d managers + 1 requester\n",NUM_MANAGERS);
+        MPI_Finalize();
+        return 1;
     }
 
-    MPI_Type_free(&mpi_msg_type);
+    MPI_Datatype T;
+    int bl[4]={1,1,NUM_GROUPS,1};
+    MPI_Aint ds[4],b;
+    MPI_Datatype ty[4]={MPI_INT,MPI_INT,MPI_C_BOOL,MPI_INT};
+    Msg tmp;
+
+    MPI_Get_address(&tmp,&b);
+    MPI_Get_address(&tmp.timestamp,&ds[0]);
+    MPI_Get_address(&tmp.rank,&ds[1]);
+    MPI_Get_address(&tmp.gset[0],&ds[2]);
+    MPI_Get_address(&tmp.group,&ds[3]);
+    for(int i=0;i<4;i++) ds[i]-=b;
+
+    MPI_Type_create_struct(4,bl,ds,ty,&T);
+    MPI_Type_commit(&T);
+
+    if(r<NUM_MANAGERS) manager(r,T);
+    else requester(r,T);
+
+    MPI_Type_free(&T);
     MPI_Finalize();
     return 0;
 }
