@@ -1,5 +1,3 @@
-/* manabe & park extended gme – strict, cleaned, optimized */
-
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
